@@ -74,7 +74,7 @@ class Output:
         self.constraint = constraint
         self.amount = amount
 
-    def can_be_spent(self, satisfier):
+    def can_be_spent(self, satisfier):  # Verify if the output can be spent based on the constraint script
         if self.constraint is None:
             return True
         try:
@@ -110,15 +110,9 @@ class Transaction:
 
     def getHash(self):
         """Return this transaction's probabilistically unique identifier as a big-endian integer"""
-         # Serialize the transaction data (inputs, outputs, and any additional data)
         serialized_data = serializer.dumps((self.inputs, self.outputs, self.data))
-        
-        # Compute the SHA-256 hash of the serialized data
         hash_bytes = hashlib.sha256(serialized_data).digest()
-
-        # Convert the hash (byte array) to a big-endian integer
         transaction_id = int.from_bytes(hash_bytes, 'big')
-
         return transaction_id
 
     def getInputs(self):
@@ -130,48 +124,41 @@ class Transaction:
         if self.outputs and 0 <= n < len(self.outputs):
             return self.outputs[n]
         return None
-    
+
     def validateMint(self, maxCoinsToCreate):
         """ Validate a mint (coin creation) transaction.
             A coin creation transaction should have no inputs,
             and the sum of the coins it creates must be less than maxCoinsToCreate.
         """
         if self.inputs is not None:
-            return False  # Mint transactions should have no inputs
-        if self.outputs:
-            coins_created = sum(output.amount for output in self.outputs)
-            return coins_created <= maxCoinsToCreate
-        return False
+            return False
+        coins_created = 0
+        for output in self.outputs:
+            coins_created = coins_created + output.amount
+        return coins_created <= maxCoinsToCreate
 
     def validate(self, unspentOutputDict):
-    # Keep existing coinbase check
-        if not self.inputs:
-            return True
-
-        if not self.outputs:
-            return False
-
+        """ Validate this transaction given a dictionary of unspent transaction outputs.
+            unspentOutputDict is a dictionary of items of the following format: { (txHash, offset) : Output }
+        """
         input_sum = 0
         output_sum = 0
 
-        # Verify each input exists and can be spent
-        for inp in self.inputs:
-            utxo_key = (inp.txHash, inp.txIdx)
-            if utxo_key not in unspentOutputDict:
+        for input in self.inputs:
+            unspentOutputDict_key = (input.txHash, input.txIdx)
+            if unspentOutputDict_key not in unspentOutputDict:
                 return False
-                
-            utxo = unspentOutputDict[utxo_key]
-            if not utxo.can_be_spent(inp.satisfier):
+            
+            utxo = unspentOutputDict[unspentOutputDict_key]
+            if not utxo.can_be_spent(input.satisfier):
                 return False
                 
             input_sum += utxo.amount
 
-        # Calculate output sum
         for out in self.outputs:
             output_sum += out.amount
 
         return input_sum >= output_sum
-
 
 class HashableMerkleTree:
     """ A merkle tree of hashable objects.
@@ -197,17 +184,24 @@ class HashableMerkleTree:
         """ Calculate the merkle root of this tree."""
         if not self.hashableList:
             return 0
+        
         current_level = self.hashableList
+        
         while len(current_level) > 1:
             next_level = []
             for i in range(0, len(current_level), 2):
                 left = current_level[i]
-                right = current_level[i + 1] if i + 1 < len(current_level) else 0
+                if i + 1 < len(current_level):
+                    right = current_level[i + 1]
+                else:
+                    right = 0
+                
                 combined = left.to_bytes(32, 'big') + right.to_bytes(32, 'big')
                 next_level.append(int.from_bytes(hashlib.sha256(combined).digest(), 'big'))
-            current_level = next_level
-        return current_level[0]
 
+            current_level = next_level
+
+        return current_level[0]
 
 class BlockContents:
     """ The contents of the block (merkle tree of transactions)
@@ -232,7 +226,6 @@ class Block:
         where we will store a merkle tree of transactions.
     """
     def __init__(self):
-        # Hint, beyond the normal block header fields what extra data can you keep track of per block to make implementing other APIs easier?
         self.prior_block_hash = None
         self.version = None
         self.merkle_tree = None
@@ -261,10 +254,16 @@ class Block:
 
     def getHash(self):
         """ Calculate the hash of this block. Return as an integer """
-        header_data = (str(self.prior_block_hash) + str(self.block_contents.calcMerkleRoot()) + 
-                      str(self.timestamp) + str(self.nonce) + str(self.target)).encode()
-        return int.from_bytes(hashlib.sha256(header_data).digest(), 'big')
-        
+        block_header = (
+            self.prior_block_hash,
+            self.block_contents.calcMerkleRoot(),
+            self.timestamp,
+            self.nonce,
+            self.target
+        )
+        serialized_data = serializer.dumps(block_header)
+        hash_bytes = hashlib.sha256(serialized_data).digest()
+        return int.from_bytes(hash_bytes, 'big')
 
     def setPriorBlockHash(self, priorHash):
         """ Assign the parent block hash """
@@ -276,13 +275,12 @@ class Block:
 
     def mine(self,tgt):
         """Update the block header to the passed target (tgt) and then search for a nonce which produces a block who's hash is less than the passed target, "solving" the block"""
-        self.setTarget(tgt)
+        self.target = tgt
         self.nonce = 0
         while self.getHash() >= tgt:
             self.nonce += 1
-        
 
-    def validate(self, unspentOutputs, maxMint): ##check this once 
+    def validate(self, unspentOutputs, maxMint):
         """ Given a dictionary of unspent outputs, and the maximum amount of
             coins that this block can create, determine whether this block is valid.
             Valid blocks satisfy the POW puzzle, have a valid coinbase tx, and have valid transactions (if any exist).
@@ -300,52 +298,58 @@ class Block:
             return None
 
         current_utxos = copy.deepcopy(unspentOutputs)
-        transactions = self.block_contents.getData().objects if (self.block_contents and 
-                      self.block_contents.getData() and hasattr(self.block_contents.getData(), 'objects')) else []
+        
+        transactions = self.block_contents.getData().objects if (
+            self.block_contents and 
+            self.block_contents.getData() and 
+            hasattr(self.block_contents.getData(), 'objects')
+        ) else []
 
         if not transactions:
             return current_utxos
-
+        
         spent = set()
-        for idx, tx in enumerate(transactions):
-            if idx == 0 and transactions:
-                if tx.inputs is not None or (tx.outputs and not tx.validateMint(maxMint)):
+
+        for txidx, txn in enumerate(transactions):
+            if txidx == 0 and transactions:
+                if txn.inputs is not None or (txn.validateMint(maxMint)):
                     return None
             else:
-                if tx.inputs is None:
+                if txn.inputs is None:
                     return None
-                for inp in tx.inputs:
-                    utxo_key = (inp.txHash, inp.txIdx)
+                
+                for input in txn.inputs:
+                    utxo_key = (input.txHash, input.txIdx)
                     if utxo_key in spent or utxo_key not in current_utxos:
                         return None
-                    if not current_utxos[utxo_key].can_be_spent(inp.satisfier):
+                    
+                    if not current_utxos[utxo_key].can_be_spent(input.satisfier):
                         return None
+                    
                     spent.add(utxo_key)
 
-            if tx.outputs:
-                tx_hash = tx.getHash()
-                for idx, out in enumerate(tx.outputs):
-                    current_utxos[(tx_hash, idx)] = out
+            if txn.outputs:
+                txn_hash = txn.getHash()
+                for idx, out in enumerate(txn.outputs):
+                    current_utxos[(txn_hash, idx)] = out
 
         for utxo_key in spent:
             del current_utxos[utxo_key]
 
         return current_utxos
 
-
 class Blockchain(object):
-    
-    def __init__(self, genesisTarget, maxMintCoinsPerTx): ##check
+    def __init__(self, genesisTarget, maxMintCoinsPerTx):
         """ Initialize a new blockchain and create a genesis block.
             genesisTarget is the difficulty target of the genesis block (that you should create as part of this initialization).
             maxMintCoinsPerTx is a consensus parameter -- don't let any block into the chain that creates more coins than this!
         """
-        self.maxMintCoinsPerTx = maxMintCoinsPerTx
         self.blocks = {}
         self.block_heights = {}
         self.cumulative_work = {}
         self.utxo_sets = {}
         self.genesisTarget = genesisTarget
+        self.maxMintCoinsPerTx = maxMintCoinsPerTx
         
         genesis = Block()
         genesis.setTarget(genesisTarget)
@@ -359,7 +363,7 @@ class Blockchain(object):
         self.utxo_sets[genesis_hash] = genesis.validate({}, self.maxMintCoinsPerTx)
 
     def getTip(self):
-        """Return the block at the tip of the chain with the most cumulative work."""
+        """ Return the block at the tip (end) of the blockchain fork that has the largest amount of work"""
         max_work = -1
         tip = None
         for block_hash, work in self.cumulative_work.items():
@@ -368,15 +372,39 @@ class Blockchain(object):
                 tip = self.blocks[block_hash]
         return tip
 
+    def getWork(self, target):
+        """Get the "work" needed for this target.  Work is the ratio of the genesis target to the passed target"""
+        if target == 0:
+            return float('inf')
+        return self.genesisTarget / target
+
+    def getCumulativeWork(self, blkHash):
+        """Return the cumulative work for the block identified by the passed hash.  Return None if the block is not in the blockchain"""
+        return self.cumulative_work.get(blkHash)
+
+    def getBlocksAtHeight(self, height):
+        """Return an array of all blocks in the blockchain at the passed height (including all forks)"""
+        return [self.blocks[h] for h in self.block_heights.get(height, [])]
+
     def extend(self, block):
-        """Add a block to the blockchain if valid."""
+        """Adds this block into the blockchain in the proper location, if it is valid.  The "proper location" may not be the tip!
+
+           Hint: Note that this means that you must validate transactions for a block that forks off of any position in the blockchain.
+           The easiest way to do this is to remember the UTXO set state for every block, not just the tip.
+           For space efficiency "real" blockchains only retain a single UTXO state (the tip).  This means that during a blockchain reorganization
+           they must travel backwards up the fork to the common block, "undoing" all transaction state changes to the UTXO, and then back down
+           the new fork.  For this assignment, don't implement this detail, just retain the UTXO state for every block
+           so you can easily "hop" between tips.
+
+           Return false if the block is invalid (breaks any miner constraints), and do not add it to the blockchain."""
+        
         if not block or block.getPriorBlockHash() is None:
             return False
-            
+        
         prior_hash = block.getPriorBlockHash()
         if prior_hash not in self.blocks:
             return False
-
+        
         parent_utxos = self.utxo_sets.get(prior_hash)
         if parent_utxos is None:
             return False
@@ -384,7 +412,7 @@ class Blockchain(object):
         new_utxos = block.validate(parent_utxos, self.maxMintCoinsPerTx)
         if new_utxos is None:
             return False
-
+        
         block_hash = block.getHash()
         self.blocks[block_hash] = block
         self.utxo_sets[block_hash] = new_utxos
@@ -403,22 +431,6 @@ class Blockchain(object):
         )
         
         return True
-
-    
-    def getWork(self, target):
-        """Calculate work based on target."""
-        if target == 0:
-            return float('inf')
-        return self.genesisTarget / target
-
-    def getCumulativeWork(self, blkHash):
-        """Return cumulative work for a block hash."""
-        return self.cumulative_work.get(blkHash)
-
-    def getBlocksAtHeight(self, height):
-        """Return list of blocks at given height."""
-        return [self.blocks[h] for h in self.block_heights.get(height, [])]
-
 # --------------------------------------------
 # You should make a bunch of your own tests before wasting time submitting stuff to gradescope.
 # Its a LOT faster to test locally.  Try to write a test for every API and think about weird cases.
